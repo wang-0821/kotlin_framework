@@ -23,4 +23,9 @@ class DemoController {
     fun printInut(@RequestBody body: String): String {
         return body
     }
+
+    @GetMapping("/throwException")
+    fun throwException() {
+        throw RuntimeException("throw Exception")
+    }
 }
