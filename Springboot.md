@@ -3,6 +3,7 @@
 * [3.Spring Bean的扫描与注册](#3)
 * [4.SpringBoot自动配置](#4)
 * [5.SpringBoot web](#5)
+* [6.SpringBoot异常处理](#6)
 
 <h2 id="1">1.SpringBoot模块结构</h2>
 &emsp;&emsp; SpringBoot项目下主要有：buildSrc、spring-boot-project、spring-boot-tests三大模块。
@@ -276,7 +277,8 @@ initializers执行初始化。4，使用SpringApplicationRunListener执行Applic
 然后会获取所有ApplicationRunner、CommandLineRunner类型的Bean，并执行这些runners。最后会发布一条ApplicationReadyEvent。
 
 ### SpringBoot启动流程图
-&emsp;&emsp; 包括SpringBoot启动时主要执行的逻辑及。
+&emsp;&emsp; SpringApplication 在refreshContext(context)开始时，会向Runtime中注册shutdownHook Thread，
+在System.exit(status)时，会执行Runtime中所有的shutdown线程。
 
 					SpringApplication初始化
     (加载spring.factories BootstrapRegistryInitializer、ApplicationListener、ApplicationContextInitializer)
@@ -655,3 +657,1253 @@ AnnotationConfigServletWebServerApplicationContext。SpringBoot 程序启动执�
 					|
 					V
 				执行finishRefresh()
+
+### Undertow WebServer创建过程
+&emsp;&emsp; ServletWebServerApplicationContext在执行onRefresh时，
+会根据ServletWebServerFactory Bean创建WebServer。如果引入了undertow依赖，
+那么默认会根据UndertowServletWebServerFactory创建WebServer。
+
+	WebServerFactoryCustomizer Bean有四种：
+	    UndertowServletWebServerFactoryCustomizer、
+	    ServletWebServerFactoryCustomizer、
+	    UndertowWebServerFactoryCustomizer、
+	    LocaleCharsetMappingsCustomizer。
+	
+	执行WebServerFactoryCustomizerBeanPostProcessor.postProcessBeforeInitialization(bean, beanName)
+					|
+					V
+		从beanFactory中获取WebServerFactoryCustomizer类型的Bean集合
+					|
+					V
+		依次执行WebServerFactoryCustomizer.customize(WebServerFactory)，
+	会向UndertowWebServerFactoryDelegate中添加UndertowOption配置类UndertowBuilderCustomizer
+					|
+					V
+		执行factory.getWebServer(ServletContextInitializer)获取WebServer
+					|
+					V
+    	执行UndertowWebServerFactoryDelegate.createBuilder(this)创建Undertow.Builder
+					|
+					V
+		创建Builder，设置ssl、address、port、bufferSize、ioThreads、
+			workThreads、directBuffers、http2
+					|
+					V
+	根据factory.port和factory.address向Undertow.Builder.listeners中添加HTTP类型的ListenerConfig
+					|
+					V
+	根据传入的ServletContextInitializer设置DeploymentInfo.servletContainerInitializers
+					|
+					V
+	依次执行UndertowBuilderCustomizer.customize(builder)进一步配置UndertowOption
+					|
+					V
+				Undertow.Builder创建完成
+					|
+					V
+	执行UndertowServletWebServerFactory.createManager(initializers)开始创建DeploymentManager
+					|
+					V
+				创建DeploymentInfo
+					|
+					V
+		用initializers设置DeploymentInfo.servletContainerInitializers
+					|
+					V
+	设置DeploymentInfo的：classLoader、contextPath、displayName、deploymentName
+					|
+					V
+		根据factory中的errorpages配置DeploymentInfo.errorPages
+					|
+					V
+	设置DeploymentInfo的：servletStackTraces、resourceManager、tempDir、eagerFilterInit、
+		preservePathOnForward、mimeMappings、listeners
+					|
+					V
+	执行factory.deploymentInfoCustomizers[UndertowDeploymentInfoCustomizer].customize(DeploymentInfo)
+					|
+					V
+			设置DeploymentInfo的：localeCharsetMapping
+					|
+					V
+	创建ServletContainer对象，执行ServletContainer.addDeployment(DeploymentInfo)获取DeploymentManager
+					|
+					V
+			执行DeploymentManager.deploy()
+					|
+					V
+		根据DeploymentManager、DeploymentInfo、ServletContainer创建Deployment
+					|
+					V
+	创建ServletContextImpl(servletContainer, deployment)，并赋值给Deployment.servletContext
+					|
+					V
+	根据ServiceLoader、ServletExtensionHolder、DeploymentInfo获取ServletExtension集合，
+	执行[ServletExtension].handleDeployment(deploymentInfo, servletContext)
+					|
+					V
+		设置Deployment.threadSetupActions、Deployment.servletPaths.welcomePages
+					|
+					V
+			设置servletContext的SessionCookieConfigImpl各属性
+					|
+					V
+	根据DeploymentInfo.sessionManagerFactory创建SessionManager并赋值给Deployment.sessionManager
+					|
+					V
+		创建一个ThreadSetupHandler.Action，并根据Deployment.threadSetupActions，
+	执行[ThreadSetupHandler].create(Action) 获取一个新的Action，最后执行Action.call(exchange, context)
+					|
+					V
+		设置Deployment的：applicationListeners、servlets、filters
+					|
+					V
+		设置ServletContext的javax.servlet.context.tempdir属性
+					|
+					V
+	根据DeploymentInfo.servletContainerInitializers.instanceFactory创建ServletContainerInitializer集合
+		执行[ServletContainerInitializer].onStartup(class, servletContext)
+					|
+					V
+		根据factory.initParameters设置ServletContext.deploymentInfo.initParameters
+					|
+					V
+		根据factory.session.cookie设置ServletContext.sessionCookieConfig
+					|
+					V ServletWebServerApplicationContext.selfInitialize(servletContext) start
+	设置ServletContext的org.springframework.web.context.WebApplicationContext.ROOT 为当前ApplicationContext，
+		设置当前GenericWebApplicationContext的servletContext为当前ServletContext
+					|
+					V
+			根据ServletContext设置ApplicationContext的scope
+					|
+					V
+	根据ServletContext向beanFactory中注册servletContext、contextParameters、contextAttributes Bean
+					|
+					V
+	获取beanFactory中的ServletContextInitializer集合，执行[ServletContextInitializer].onStartup(servletContext)
+					|ServletWebServerApplicationContext.selfInitialize(servletContext) end
+					V
+		向Deployment.sessionManager中注册SessionListener
+					|
+					V
+		根据DeploymentInfo中的errorPages设置Deployment的errorPages
+					|
+					V
+		根据DeploymentInfo中的mimeMappings设置Deployment的mimeMappings
+					|
+					V
+			发送context initialized事件
+					|
+					V
+	创建ServletDispatchingHandler HttpHandler，根据DeploymentInfo.innerHandlerChainWrappers，
+		执行[HandlerWrapper].wrap(ServletDispatchingHandler)得到一个新的wrappedHandler
+					|
+					V
+		创建RedirectDirHandler(wrappedHandler, servletPaths) wrappedHandler
+					|
+					V
+	创建PredicateHandler(Predicate, secureHandler, wrappedHandler)作为wrappedHandler skippable
+					|
+					V
+	根据DeploymentInfo.outerHandlerChainWrappers，执行[HttpWrapper].wrap(wrappedHandler)作为outerHandler
+					|
+					V
+		创建SendErrorPageHandler(outerHandler)作为outerHandler
+					|
+					V
+	创建PredicateHandler(Predicate, outerHandler, wrappedHandler)作为wrappedHandler
+					|
+					V
+		根据DeploymentInfo.sessionPersistenceManager处理wrappedHandler skippable
+					|
+					V
+		根据DeploymentInfo.metricsCollector处理wrappedHandler skippable
+					|
+					V
+	根据DeploymentInfo.crawlerSessionManagerConfig处理wrappedHandler skippable
+					|
+					V
+	根据Deployment.servletPaths、wrappedHandler、Deployment、ServletContext创建ServletInitialHandler
+					|
+					V
+		根据Deployment.deploymentInfo.initialHandlerChainWrappers，
+		执行[HandlerWrapper].wrap(ServletInitialHandler)结果作为initialHandler
+					|
+					V
+		创建HttpContinueReadHandler(initialHandler)作为initialHandler
+					|
+					V skippable
+	根据DeploymentInfo.urlEncoding创建URLDecodingHandler(urlEncoding, initialHandler)作为initialHandler
+					|
+					V
+	设置Deployment的initialHandler(initialHandler)、servletHandler(ServletInitialHandler)
+					|
+					V
+			执行ServletContext.initDone()
+					|
+					V
+			执行Deployment.servletPaths.initData()
+					|
+					V
+	根据Deployment.deploymentInfo.filterUrlMappings计算pathMatches、extensionMatches
+					|
+					V
+	根据Deployment.servlets.managedServletMap计算pathMatches(Set<String>)、
+	extensionMatches(Set<String>)、defaultServlet(ServletHandler)、
+	pathServlets(Map<String, ServletHandler>)、extensionServlets(Map<String, ServletHandler>)
+					|
+					V
+	如果Deployment.servlets没有"default" ServletHandler，则新建一个作为"default"添加到servlets里
+					|
+					V
+			创建ServletPathMatchesData.Builder对象
+					|
+					V
+	根据pathMatches和DeploymentInfo.getFilterMappings()计算noExtension(Map<DispatcherType, List<ManagedFilter>>)、
+		extension(Map<String, Map<DispatcherType, List<ManagedFilter>>>)
+					|
+					V
+	根据pathMatches(pathMatch以"/*"结尾)设置ServletPathMatchesData.Builder.prefixMatches，
+		并设置PathMatch的defaultHandler、requireWelcomeFileMatch
+					|
+					V
+	根据pathMatches(pathMatch以"/*"结尾)和extension设置ServletPathMatchesData.Builder.prefixMatches，
+			并设置PathMatch的extensionMatches
+					|
+					V
+	根据pathMatches(pathMatch为空)，设置ServletPathMatchesData.Builder.exactPathMatches
+					|
+					V
+	根据pathMatches(pathMatch其他)，设置ServletPathMatchesData.Builder.exactPathMatches
+					|
+					V
+	根据Deployment.getServletHandlers()和DeploymentInfo.getFilterMappings()，
+		设置ServletPathMatchesData.Builder.nameMatches
+					|
+					V
+	执行ServletPathMatchesData.Builder.build()获取ServletPathMatchesData并赋值给Deployment.servletPaths.data
+					|
+					V
+			Deployment.servletPaths.initData()执行完毕
+					|
+					V
+	执行[DeploymentInfo.deploymentCompleteListeners].contextInitialized(ServletContextEvent(ServletContext))
+					|
+					V
+			DeploymentManager.deploy()执行完毕
+					|
+					V
+		设置DeploymentManager中DeploymentInfo的mimeExtensionMappings
+					|
+					V
+	设置DeploymentManager.deployment.sessionManager中的defaultSessionTimeout为factory.session.timeout
+					|
+					V
+				DeploymentManager创建完毕
+					|
+					V
+	执行getUndertowWebServer(Builder, DeploymentManager, factory.port)创建UndertowServletWebServer
+					|
+					V
+	执行UndertowWebServerFactoryDelegate(webServerFactory, DeploymentManagerHttpHandlerFactory(DeploymentManager))
+				获取HttpHandlerFactory集合
+					|
+					V
+	创建UndertowServletWebServer(Builder, [HttpHandlerFactory], webServer.contextPath, autoPort)
+					
+					
+### Undertow WebServer启动过程
+&emsp;&emsp; 在执行LifecycleProcessor.onRefresh()时，会启动WebServer。
+
+	Map<Integer, LifecycleGroup> phases 由于采用phase为key，且采用TreeMap，
+	TreeMap会对key进行排序，因此会按照phase顺序执行LifecycleGroup.start()
+	
+	Lifecycle Bean有两种:
+	    WebServerStartStopLifecycle、
+	    WebServerGracefulShutdownLifecycle。
+	    
+        SelectionKey类型，0表示不关注任何事件：
+	    OP_READ = 1、
+	    OP_WRITE = 4、
+	    OP_CONNECT = 8、
+	    OP_ACCEPT = 16。
+		
+				执行DefaultLifecycleProcessor.onRefresh()
+						|
+						V
+				执行getLifecycleBeans()获取LifeCycle Bean集合
+						|
+						V
+		根据LifeCycle的getPhase()值不同，创建LifecycleGroup，一个phase值对应一个LifecycleGroup
+						|
+						V
+		根据Lifecycle Bean的phase值的不同，将Lifecycle添加到不同的LifecycleGroup中
+						|
+						V
+					执行[LifecycleGroup].start()
+						|
+						V
+				执行WebServerStartStopLifecycle.start()
+						|
+						V
+					执行WebServer.start()
+						|
+						V
+		执行UndertowWebServer.createUndertowServer()创建UndertowWebServer.undertow
+						|
+						V
+	执行UndertowWebServer.httpHandlerFactories(DeploymentManagerHttpHandlerFactory).getHandler(null),
+			创建DeploymentManagerHandler(DeploymentManager) HttpHandler
+						|
+						V
+			设置Undertow.Builder.handler为上一步创建的HttpHandler
+						|
+						V
+		创建Undertow(Undertow.Builder)，将Undertow.Builder中的属性赋值给Undertow
+						|
+						V
+					执行Undertow.start()
+						|
+						V
+		根据ServiceLoader获取XnioProvider，执行XnioProvider.getInstance()获取Xnio
+						|
+						V
+				执行Xnio.createWorker(OptionMap)创建XnioWorker
+						|
+						V
+				根据Xnio创建XnioWorker.Builder(Xnio)
+						|
+						V
+			根据OptionMap将各配置项赋值给XnioWorker.Builder
+						|
+						V
+			执行Xnio.build(XnioWorker.Builder)创建NioXnioWorker
+						|
+						V
+	设置NioXnioWorker的：xnio、terminationTask、name、bindAddressTable、taskPool、workerStackSize
+						|
+						V 
+	根据XnioWorker.Builder.workerIoThreads数值，创建WorkerThread集合，赋值给NioXnioWorker.workerThreads
+       --------------------------------------->	|
+      |						V
+      |			使用Xnio.mainSelectorCreator.open创建一个Selector threadSelector
+      |						|
+      |						V
+      |  创建WorkerThread(NioXnioWorker, threadSelector, name, ThreadGroup, workerStackSize, number)
+       -----------------------------------------|
+						V
+			使用Xnio.mainSelectorCreator.open创建一个Selector threadSelector
+						|
+						V
+	创建一个WorkerThread(NioXnioWorker, threadSelector, name, ThreadGroup, workerStackSize, number)
+				赋值给NioXnioWorker.acceptThread
+						|
+						V
+			创建NioWorkerMetrics，并执行NioWorkerMetrics.register()
+						|
+						V
+					NioXnioWorker创建完成
+						|
+						V
+					执行NioXnioWorker.start()
+						|
+						V
+		启动NioXnioWorker.workerThreads线程集，启动NioXnioWorker.acceptThread
+						|
+						V
+			Xnio.createWorker(OptionMap)创建XnioWorker执行完成
+						|
+						V
+			如果Undertow.byteBufferPool为空，那么创建ByteBufferPool
+						|
+						V
+				循环处理Undertow.listeners ListenerConfig
+						|
+						V
+	如果ListenerConfig.rootHandler不为空，那么将其作为rootHandler，否则取Undertow.rootHandler
+						|
+						V
+			根据ByteBufferPool和OptionMap创建HttpOpenListener
+						|
+						V
+	如果允许使用http2，那么handler为Http2UpgradeHandler(rootHandler)，否则为rootHandler
+						|
+						V
+			将handler赋值给HttpOpenListener.rootHandler
+						|
+						V
+			执行ChannelListeners.openListenerAdapter(HttpOpenListener)，
+		创建ChannelListener<AcceptingChannel<StreamConnection>> acceptListener
+						|
+						V
+			根据ListenerConfig的host和port创建InetSocketAddress
+						|
+						V
+	执行NioXnioWorker.createStreamConnectionServer(InetSocketAddress, acceptListener, OptionMap)，
+					创建AcceptingChannel server
+						|
+						V
+	执行NioXnioWorker.createTcpConnectionServer(InetSocketAddress, acceptListener, OptionMap)
+						|
+						V
+			执行ServerSocketChannel.open()获取一个ServerSocketChannel
+						|
+						V
+		根据OptionMap设置ServersocketChannel的：receiveBufferSize、reuseAddress、backlog
+						|
+						V
+	执行ServerSocketChannel.socket.bind(InetSocketAddress, backlog)，将socket绑定到address上，
+			如果这个address是无效的，那么将会绑定到本地任意一个有效的端口上。
+						|
+						V
+		根据NioXnioWorker、ServerSocketChannel、OptionMap创建NioTcpServer
+						|
+						V
+			执行NioXnioWorker.acceptThread.registerChannel(ServerSocketChannel)，
+			执行ServerSocketChannel.register(Selector, 0)，返回SelectionKey
+						|
+						V
+		根据NioTcpServer、SelectionKey、NioXnioWorker.acceptThread，创建NioTcpServerHandle
+						|
+						V
+		执行SelectionKey.attach(NioTcpServerHandle)，将NioTcpServerHandle贴到SelectionKey
+						|
+						V
+			设置NioTcpServer.handles为创建的NioTcpServerHandle，
+		设置NioTcpServer.mbeanHandle为NioXnioWorker.registerServerMXBean(XnioServerMXBean)
+						|
+						V
+					NioTcpServer创建完毕
+						|
+						V
+				根据NioTcpServer创建QueuedNioTcpServer2
+						|
+						V
+	根据NioXnioWorker.workerThreads数量，创建同等数量的LinekedBlockingQueue，赋值给acceptQueues
+						|
+						V
+		向NioTcpServer.closeSetter中设置ChannelListener，设置NioTcpServer.acceptListener
+						|
+						V
+	设置QueuedNioTcpServer2.acceptListener为之前创建的acceptListener，QueuedNioTcpServer2创建完毕
+						|
+						V
+	NioXnioWorker.createTcpConnectionServer(InetSocketAddress, acceptListener, OptionMap)执行完毕
+						|
+						V
+				执行QueuedNioTcpServer.resumeAccepts()
+						|
+						V
+			执行NioTcpServer.doResume(SelectionKey.OP_ACCEPT)
+						|
+						V
+			根据NioTcpServer.handles，执行[NipTcpServerHandle].resume()
+						|
+						V
+	据NioTcpServerHandle.workerThread即NioXnioWorker.acceptThread，执行WorkerThread.execute(Runnable)
+						|
+						V
+			将Runnable添加到WorkerThread.selectorWorkQueue中，
+		让NioXnioWorker.acceptThread异步执行resume(SelectionKey.OP_ACCEPT)
+						|
+						V
+				执行WorkerThread.setOps(SelectionKey, ops)
+						|
+						V
+		执行SelectionKey.interestOps(SelectionKey.OP_ACCEPT)，设置SelectionKey的interestOp
+						|
+						V
+			ApplicationContext发布ServletWebServerInitializedEvent
+						|
+						V
+					UndertowWebServer启动成功
+					
+### WorkerThread
+&emsp;&emsp; WorkerThread是用来执行Server 请求的具体线程。
+
+				WorkerThread执行流程：
+				WorkerThread.run()
+					|
+        ------------------------------> V
+       |		执行selectorWorkQueue.poll()，获取Runnable task-------------------
+       |				| task is null			else		|
+       |				V						|
+       |		处理delayWorkQueue (TreeSet<TimeKey>)			       |
+       |				|						|
+       |				V						|
+       |			获取当前nanoTime					     |
+       |				|						|
+       |   ---------------------------> V						|
+       |  |		  从delayWorkQueue获取TimeKey				      |
+       |  |		  		|						|
+       |  |			 	V						|
+       |  |	如果TimeKey.deadline已经到达,将TimeKey.command添加selectorWorkQueue，	 |
+       |  |	否则根据TimeKey.deadline和算出到期剩余时间delayTime，跳出循环		    |
+       |  | loop  delayWorkQueue	|						|
+       |   -----------------------------V						|
+       |		执行selectorWorkQueue.poll()，获取task			     |
+       |				| <---------------------------------------------						
+       |				V
+       |	执行Thread.interrupted()，清理线程的interrupt状态
+       |				|
+       |				V
+       |	如果Runnable task不为空，那么执行Runnable，并继续循环
+       ---------------------------------|
+       	loop while task not null	V
+			如果WorkerThread.state为SHUTDOWN ------------------------
+					|			else		|
+					V					|
+		如果selector的SelectionKey数量为0，且selectorWorkQueue为空-----	 |
+					|			    else   |	|
+					V				   |	|
+				     return				   |	|
+									   |	|
+					 ----------------------------------	|
+					|					|
+					V					|
+		根据Selector获取SelectionKey集合，赋值给keys SelectionKey[]	 |
+					|					|
+	      ------------------------>	V					|
+	     |		执行SelectionKey.attachment()，获取NioHandle		     |
+	     |				|					|
+	     |				V					|
+	     |	如果NioHandle不为空，执行SelectionKey.ServerSocketChannel.close()，|
+	     |		并执行NioTcpServerHandle.forceTermination()	      |
+	     | 	loop keys		|					|
+	      ------------------------- V					|
+				清理keys，全部置空				   |
+					| <-------------------------------------
+					V
+		执行Thread.interrupted()，清理线程的interrupt状态
+					|
+					V
+			如果WorkerThread.state状态不是SHUTDOWN------------
+					|				|
+					V				V
+		执行selectorWorkQueue.peek()获取Runnable任务	如果WorkerThread.state为SHUTDOWN，而之前没return，
+					|			说明SelectionKey数量不为0
+					V				|
+		如果Runnable任务不为空，执行selector.selectNow()		 V
+					|		执行Selector.selectNow()非阻塞方法，获取I/O事件
+					V				|
+		如果Runnable任务为空，delayTime不为Long.MAX_VALUE，	 |
+		说明delayWorkQueue中还有没执行完的延时任务，		      |
+		此时执行selector.select(delayMills)。		    |
+		如果deplayTime为Long.MAX_VALUE，			     |
+		说明没有待处理的任务，执行selector.select()阻塞任务。	    |
+					| <-----------------------------				
+					V
+		执行Selector.selectedKeys()获取SelectionKey集合赋值给keys
+					|
+	     -------------------------> V
+	    |		获取SelectionKey的interestOps、attachment(NioHandle)
+	    |				|
+	    |				V
+	    |	如果attachment为空，执行cancelKey(key, false)来取消该SelectionKey
+	    |				|
+	    |				V
+	    |	如果attachment不为空，执行attachment(NioHandle).handleReady(key.readyOps())
+	     ---------------------------|
+			loop keys		
+	
+### NipTcpServerHandle
+&emsp;&emsp; ServerSocketChannel会绑定到NioXnioWorker.acceptThread.selector，创建一个SelectionKey。
+NioTcpServerHandle也会以attachment的方式，附着在这个SelectionKey上。当QueuedNioTcpServer2.resumeAccepts()时，
+实际是在执行NioTcpServerHandle.resume()，这个方法会设置SeverSocketChannel.interestOps。
+
+<br>
+&emsp;&emsp; 首先由于NioXnioWorker.workerThreads中各个WorkerThread并没有绑定任何channel，
+因此这些WorkerThread不会获取到任何Socket I/O事件。最开始只有NioXnioWorker.acceptThread会监听Socket I/O事件。
+
+				NioTcpServerHandle.handleReady(ops)
+						|
+						V
+	执行ChannelListeners.invokeChannelListener(NioTcpServer, NioTcpServer.acceptListener)
+						|
+						V
+				执行ChannelListener.handleEvent(NioTcpServer),
+			该ChannelListener对应的lambda实际为QueuedNioTcpServer2中的handleReady()
+						|
+						V
+					执行NioTcpServer.accept()
+						|
+						V
+			执行ServerSocketChannel.accept()获取一个SocketChannel
+						|
+						V
+			执行ThreadLocalRandom.current.nextInt()获取一个hash值
+						|
+						V
+			根据hash值在NioXnioWorker.workerThreads中获取一个WorkerThread
+						|
+						V
+			执行WorkerThread.registerChannel(SocketChannel)，获取一个SelectionKey
+						|
+						V
+			执行SocketChannel.register(WorkerThread.selector, 0)，
+			将SocketChannel绑定到NioXnioWorker.workerThreads中的Selector
+						|
+						V
+		根据WorkerThread、SelectionKey、NioTcpServerHandle创建NioSocketStreamConnection
+						|
+						V
+		根据WorkerThread、SelectionKey、NioSocketStreamConnection创建NioSocketConduit
+						|
+						V
+				将NioSocketConduit attach到SelectionKey
+						|
+						V
+			NioTcpServer.accept()执行完毕，获取一个NioSocketStreamConnection
+						|
+	 ------------------------------------->	V
+	|	将创建的NioSocketStreamConnection添加到QueuedNioTcpServer2.acceptQueues中
+	|					|
+	|					V
+	|		执行WorkerThread.execute(QueuedNioTcpServer2.acceptTask)
+	|					|
+	|					V
+	|	根据WorkerThread.number，从QueuedNioTcpServer2.acceptQueues中获取Queue<StreamConnection>
+	|					|
+	|					V
+	|	执行ChannelListeners.invokeChannelListener(QueuedNioTcpServer2, QueuedNioTcpServer2.acceptListener)
+	|					|
+	|					V
+	|		执行ChannelListener.handleEvent(QueuedNioTcpServer2)
+	|					|
+	|					V
+	|		执行Undertow中acceptListener，继而执行Undertow中finalListener
+	|					|
+	|					V
+	|		执行HttpOpenListener.handleEvent(NioSocketStreamConnection)
+	|					|
+	|					V
+	|	根据NioSocketStreamConnection、HttpOpenListener的：bufferPool、rootHandler、
+	|	undertowOptions、bufferSize、connectorStatistics创建HttpServerConnection
+	|					|
+	|					V
+	|	根据HttpServerConnection、HttpOpenListener的：parser、connectorStatistics创建HttpReadListener			
+	|					|
+	|					V
+	|		向HttpOpenListener.connections添加HttpServerConnection
+	|					|
+	|					V
+	|		设置HttpServerConnection.readListener为HttpReadListener
+	|					|
+	|					V
+	|	设置NioSocketStreamConnection.sourceChannel.readListener为HttpReadListener
+	|					|
+	|					V
+	|	执行HttpReadListener.handleEvent(NioSocketStreamConnection.sourceChannel)
+	|					|
+	|					V
+	|	执行HttpServerConnection.bufferPool.allocate()获取PooledByteBuffer
+	|					|
+	|					V
+	|		执行PooledByteBuffer.getBuffer()获取ByteBuffer
+	|      ------------------------------->	|
+	|     |					V
+	|     |	执行NioSocketStreamConnection.sourceChannel(ConduitStreamSourceChannel).read(ByteBuffer)
+	|     |					|
+	|     |					V
+	|     |	执行SocketChannel.read(ByteBuffer)，将SocketChannel中的字节流读取到ByteBuffer中
+	|     |					|
+	|     |					V
+	|     |		如果HttpReadListener.httpServerExchange为空，根据HttpServerConnection、
+	|     |		HttpReadListener.maxEntitySize创建HttpServerExchange，并赋值。
+	|     |					|
+	|     |					V
+	|     |	执行HttpReasListener.parser.handle(ByteBuffer, HttpReadListener.state, httpServerExchange)
+	|     |					|
+	|     |					V
+	|     |	parser.handle()会解析并设置httpServerExchange的：requestMethod、
+	|     |	requestPath、relativePath、requestURI、queryString、queryParameters、
+	|     |		pathParameters、quprotocol、requestHeaders、
+	|     |					|
+	|     |					V
+	|     -------------------如果没解析完毕，继续读取SocketChannel中字节流
+	|	loop				|
+	|					V
+	|		设置HttpServerConnection.current为HttpServerExchange
+	|					|
+	|					V
+	|  执行Connectors.executeRootHandler(HttpServerConnection.rootHandler, HttpServerExchange)
+	|					|
+	|					V
+	|		执行rootHandler.handleRequest(HttpServerExchange)
+	|					|
+	|					V
+	|	执行HttpServerExchange.getDispatchtask()获取Runnable dispatchTask
+	|					|
+	|					V
+	|	获取HttpServerExchange.connection.channel.thread.worker作为Executor
+	|					|
+	|					V
+	|		执行NioXnioWorker.taskPool.execute(Runnable)
+	|					|
+	|					V
+	|			执行PooledByteBuffer.close()
+	|					|
+	|					V
+	|	HttpReadListener.handleEvent(NioSocketStreamConnection.sourceChannel)执行完毕
+	|					|
+	|					V
+	|	HttpOpenListener.handleEvent(NioSocketStreamConnection)执行完毕
+	|					|
+	|					V
+	| ChannelListeners.invokeChannelListener(QueuedNioTcpServer2, QueuedNioTcpServer2.acceptListener)执行完毕
+	|					|
+	|					V
+	|	如果Queue<StreamConnection>不为空，执行WorkerThread.execute(QueuedNioTcpServer2.acceptTask)
+	|					|
+	|					V
+	|			QueuedNioTcpServer2.acceptTask执行完毕
+	|					|
+	|					V
+	|		如果NioTcpServer.accept()的数量超过128，直接return
+	|					|
+	|					V
+	|				执行NioTcpServer.accept()
+	|					|
+	|					V
+	 --------------如果accept获取不到NioSocketStreamConnection，直接return
+						
+						
+### HttpHandler
+&emsp;&emsp; 在创建Undertow WebServer时，会构建HttpHandler。WebServer启动后，在获取到请求后，
+会创建HttpServerExchange，然后执行HttpHandler.handleRequest(HttpServerExchange)。
+根据Undertow WebServer的创建流程来看，rootHandler为DeploymentManagerHandler(DeploymentManager)。
+
+			DeploymentManagerHandler.handler wrap链为：
+				HttpContinueReadHandler
+		    			|
+					V
+				ServletInitialHandler
+					|
+					V
+		   	 --------PredicateHandler---------------
+		  	|	   				|
+		  	V  	   				V
+		trueHandler(SendErrorPageHandler)	falseHandler(PredicateHandler)
+		  	|				  |			|
+		  	V				  V			V
+	  	PredicateHandler----------	     falseHandler	    trueHandler
+	  	|			  |		  |			|
+	  	V	  		  V               |			|
+	    trueHandler	  	      falseHandler        |			|
+	    	|			      |		  |			|
+		|                             V		  V			|
+	    	|     			    RedirectDirHandler			|
+		|			   	   |				|
+	   	|   				   V				|
+		|			  ServletDispatchingHandler		|
+		|								|
+		 -----------------------	 -------------------------------
+					|	|
+					V	V
+				SecurityInitialhandler
+					   |
+				 	   V
+			  CachedAuthenticatedSessionHandler
+					   |
+					   V
+			  AuthenticationMechanismsHandler	
+					   |			   
+					   V			
+			ServletConfidentialityConstraintHandler
+					   |
+					   V
+	  			   PredicateHandler
+	 			   |		|
+	 			   V		V
+				trueHandler falseHandler
+	  			  |		|
+	  			  V		|
+    			DisableCacheHandler     |
+    	  			 |		|
+	  			 V		V
+    			ServletAuthenticationCallHandler
+					|
+					V
+    			SSLInformationAssociationHandler
+    					|
+					V
+				RedirectDirHandler
+					|
+					V
+				ServletDispatchingHandler
+	
+	
+					HttpHandler执行流程：
+			DeploymentManagerHandler.handleRequest(HttpServerExchange)
+						|
+						V
+			HttpContinueReadHandler.handleRequest(HttpServerExchange)
+						|
+						V
+			ServletInitialHandler.handleRequest(HttpServerExchange)
+						|
+						V
+			校验HttpServerExchange.relativePath path 是否是禁止的路径
+						|
+						V
+	执行ServletInitialHandler.paths.getServletHandlerByPath(path)获取ServletPathMatch
+						|
+						V
+	创建HttpServletResponseImpl(HttpServerExchange, ServletInitialHandler.servletContext) response
+						|
+						V
+	创建HttpServletRequestImpl(HttpServerExchange, ServletInitialHandler.servletContext) request
+						|
+						V
+	创建ServletRequestContext(ServletContext.deployment, request, response, ServletPathMatch)
+						|
+						V
+	设置HttpServerExchange.maxEntitySize = ServletPathMatch.servletChain.managedServlet.maxRequestSize
+						|
+						V
+	HttpServerExchange设置ServletRequestContext.ATTACHMENT_KEY attachment为ServletRequestContext
+						|
+						V
+	创建ServletBlockingHttpExchange(HttpServerExchange)，并赋值给HttpServerExchange.blockingHttpExchange
+						|
+						V
+				设置ServletRequestContext.servletPathMatch
+						|
+						V
+		执行HttpServerExchange.dispatch(null, ServletInitialHandler.dispatchHandler)
+						|
+						V
+				设置HttpServerExchange.dispatchTask Runnable
+						|
+						V
+	获取Executor为NioXnioWorker，利用taskPool，异步执行NioXnioWorker.execute(dispatchTask)
+						|
+						V
+	执行Connectors.executeRootHandler(ServletInitialHandler.dispatchHandler, HttpServerExchange)
+						|
+						V
+		执行ServletInitialHandler.dispatchHandler.handleRequest(exchange)
+						|
+						V
+		根据ServletRequestContext.ATTACHMENT_KEY获取ServletRequestContext
+						|
+						V
+	执行dispatchRequest(exchange, servletRequestContext, ServletPathMatch.servletChain, DispatcherType)
+						|
+						V
+	执行ServletInitialHandler.handleFirstRequest(HttpServerExchange, ServletRequestContext)
+						|
+						V
+		执行ServletInitialHandler.next(PredicateHandler).handleRequest(exchange)
+						|
+						V
+	执行Predicate.predicate(DispatcherTypePredicate).resolve(exchange)，得到trueHandler(SendErrorPageHandler)
+						|
+						V
+				执行SendErrorPageHandler.handleRequest(exchange)
+						|
+						V
+	PredicateHandler.handleRequest(exchange)，PredicateHandler.predicate为DispatcherTypePredicate
+						|
+						V
+			执行SecurityInitialHandler.handleRequest(exchange)
+						|
+						V
+			执行CachedAuthenticatedSessionHandler.handleRequest(exchange)
+						|
+						V
+	执行CachedAuthenticatedSessionHandler.servletContext.getSession(exchange, false)获取HttpSession
+						|
+						V
+		执行AuthenticationMechanismsHandler.handleRequest(exchange)
+						|
+						V
+		执行ServletConfidentialityConstraintHandler.handleRequest(exchange)
+						|
+						V
+			执行PredicateHandler.handleRequest(exchange)
+						|
+						V
+		执行ServletAuthenticationCallHandler.handleRequest(exchange)
+						|
+						V
+		执行SSLInformationAssociationHandler.handlRequest(exchange)
+						|
+						V
+			执行RedirectDirHandler.handleRequest(exchange)
+						|
+						V
+			执行ServletDispatchingHandler.handleRequest(exchange)
+						|
+						V
+	根据HttpServerExchange的ServletRequestContext.ATTACHMENT_KEY attachment取ServletRequestContext，
+		根据ServletRequestContext.currentServlet获取ServletChain
+						|
+						V
+			执行ServletChain.handler.handleRequest(exchange)
+						|
+						V
+			执行ServletChain.forceInit(DispatcherType)
+						|
+						V
+		执行ServletChain.filters.get(DispatcherType)，获取ManagedFiletr集合
+						|
+						V
+				执行[ManagedFilter].forceInit()
+						|
+						V
+			执行ServletChain.managedServlet.forceInit()
+						|
+						V
+		执行ManagedServlet.instanceStrategy(DefaultInstanceStrategy).start()
+						|
+						V
+		执行DefaultInstanceStrategy.factory.createInstance()，赋值给DefaultInstanceStrategy.handle
+						|
+						V
+	执行DrfaultInstanceStrategy.handle(ImmediateInstanceHandle).getInstance()，获取DispatcherServlet。
+						|
+						V
+		创建LifecyleInterceptorInvocation(DeploymentInfo.lifecycleInterceptors, servletInfo, 
+		DispatcherServlet, ServletConfigImpl(servletInfo, servletContext))
+						|
+						V
+				执行LifecyleInterceptorInvocation.proceed()
+						|
+						V
+				执行DispatcherServlet.init(ServletConfigImpl)
+						|
+						V
+		根据ServletConfigImpl.servletInfo.initParams设置DispatcherServlet属性
+						|
+						V
+		执行DispatcherServlet.onRefresh(ApplicationContext)，主要确保以下Bean都存在：
+		MultipartResolver、LocaleResolver、ThemeResolver、HandlerMapping、
+		HandlerAdapter、HandlerExceptionResolver、RequestToViewNameTranslator、
+				ViewResolver、FlashMapManager
+						|
+						V
+			LifecyleInterceptorInvocation.proceed()执行完毕
+						|
+						V
+			ServletChain.managedServlet.forceInit()执行完毕
+						|
+						V
+	执行ServletChain.originHandler(ServletSecurityRoleHandler).handleRequest(exchange)
+						|
+						V
+		执行ServletSecurityRoleHandler.next(FilterHandler).handleRequest(exchange)
+						|
+						V
+		根据DispatcherType从FilterHandler.filters中获取对应类型的ManagedFilter filters集合
+	filterClass包括：OrderedCharacterEncodingFilter、OrderedFormContentFilter、OrderedRequestContextFilter
+		    				|
+						V
+		创建FilterChainImpl(exchange, filters, next, allowNonStandardWrappers)
+						|
+						V
+	执行FilterChainImpl.doFilter(ServletRequestContext.servletRequest, ServletRequestContext.servletResponse)
+						|
+						V
+		执行OrderedCharacterEncodingFilter.doFilter(request, response, FilterHandler)
+						|
+						V
+		执行OrderedFormContentFilter.doFilter(request, response, FilterHandler)
+						|
+						V
+		执行OrderedRequestContextFilter.doFilter(request, response, FilterHandler)
+						|
+						V
+		执行FilterHandler.next(ServletHandler).handleRequest(HttpServerExchange)
+						|
+						V
+		执行ServletHandler.managedServlet.getServlet().getInstance()获取DispatcherServlet
+						|
+						V
+		执行DispatcherServlet.service(HttpServletRequest, HttpServletResponse)-----------
+						|		     如果RequestMethod是PATCH或空 |
+						|						V
+						|	执行DispatcherServlet.processRequest(request, response)
+						V
+		根据HttpMethod处理Http请求，执行：doPost(req, res)、doPut(req, res)、doDelete(req, res)、
+		doOptions(req, res)、doTrace(req, res)、doHead(req, res)、doGet(req, res)。
+						|
+						V
+			执行DispatcherServlet.processRequest(request, response)
+						|
+						V
+		创建WebAsyncManager，添加callableInterceptors RequestBindingInterceptor
+						|
+						V
+			执行DispatcherServlet.doService(request, response)
+						|
+						V
+			执行DispatcherServlet.doDispatch(request, response)
+						|
+						V
+	如果HttpServletRequest是multipart，执行DispatcherServlet.multipartResolver.resolveMultipart(request)，
+				获取一个新的HttpServletRequest
+						|
+						V
+		执行DispatcherServlet.getHandler(request)获取HandlerExecutionChain
+						|
+						V
+		根据DispatcherServlet.handlerMappings，执行[HandlerMapping].getHandler(request)，
+		一旦获取到一个非空的HandlerExecutionChain，则返回。HandlerMapping类型有：
+		RequestMappingHandlerMapping、BeanNameUrlHandlerMapping、RouterFunctionMapping、
+		SimpleUrlHandlerMapping、WelcomePageHandlerMapping。
+						|
+						V
+			执行RequestMappingHandlerMapping.getHandler(request)
+						|
+						V
+		执行UrlPathHelper.resolveAndCacheLookupPath(request)获取lookupPath
+						|
+						V
+		根据RequestMappingHandlerMapping.mappingRegistry的：pathLookup、registry获取Match，
+			根据Match.registration.handlerMethod获取HandlerMethod
+						|
+						V
+			根据HandlerMethod.bean可以获取到真实的controller Bean
+						|
+						V
+			根据获取到的HandlerMethod可以创建HandlerExecutionChain
+						|
+						V
+			根据RequestMappingHandlerMapping.adaptedInterceptors，
+		向HandlerExecutionChain.interceptorList中添加HandlerInterceptor
+						|
+						V
+		[HandlerMapping].getHandler(request)执行完毕，获取到一个HandlerExecutionChain
+						|
+						V
+	根据DispatcherServlet.handlerAdapters，执行[HandlerAdapter].supports(HandlerExecutionChain.handler)，
+	如果匹配。则返回该HandlerAdapter。HandlerAdapter类型有：RequestMappingHandlerAdapter、HandlerFunctionAdapter、
+	HttpRequestHandlerAdapter、SimpleControllerHandlerAdapter。
+						|
+						V
+	执行HandlerAdapter.handle(request, response, HandlerExecutionChain.handler)获取ModelAndView
+						|
+						V
+	执行RequestMappingHandlerAdapter.handle(request, response, HandlerExecutionChain.handler)
+						|
+						V
+	创建ServletWebRequest(request, response)，创建ServletInvocableHandlerMethod(HandlerMethod)
+						|
+						V
+	根据RequestMappingHandlerAdapter.argumentResolvers设置ServletInvocableHandlerMethod.resolvers
+						|
+						V
+	使用RequestMappingHandlerAdapter.returnValueHandlers，设置ServletInvocableHandlerMethod.returnValueHandlers
+						|
+						V
+		设置ServletInvocableHandlerMethod的：dataBinderFactory、parameterNameDiscoverer
+						|
+						V
+				创建并初始化ModelAndViewContainer
+						|
+						V
+			处理ServletInvocableHandlerMethod的@ModelAttribute
+						|
+						V
+		执行ServletInvocableHandlerMethod.invokeAndHandle(ServletWebRequest, ModelAndViewContainer)
+						|
+						V
+	执行ServletInvocableHandlerMethod.getMethodArgumentValues(ServletWebRequest, ModelAndViewContainer)
+						|
+						V
+			根据ServletWebRequest.parameters 获取MethodParameter集合
+	执行resolvers.resolveArgument(parameter, mavContainer, request, dataBinderFactory)获取参数值
+						|
+						V
+			根据HandlerMethodArgumentResolverComposite.argumentResolvers，
+	执行[HandlerMethodArgumentResolver].supportsParameter(MethodParameter)，获取HandlerMethodArgumentResolver
+						|
+						V
+	执行HandlerMethodArgumentResolver.resolveArgument(parameter, mavContainer, webRequest, binderFactory)，获取参数值
+						|
+						V
+				执行ServletInvocableHandlerMethod.doInvoke(args)获取执行结果
+						|
+						V
+		执行ServletInvocableHandlerMethod.returnValueHandlers.handleReturnValue(
+			returnValue, returnType, mavContainer, webRequest)处理执行结果
+						|
+						V
+		根据HandlerMethodReturnValueHandlerComposite.returnValueHandlers，
+	[HandlerMethodReturnValueHandler].supportsReturnType(returnType)获取HandlerMethodReturnValueHandler
+						|
+						V
+	执行HandlerMethodReturnValueHandler.handleReturnValue(returnValue, returnType, mavContainer, webRequest)
+						|
+						V
+		RequestMappingHandlerAdapter.handle(request, response, HandlerExecutionChain.handler)执行完毕
+						|
+						V
+			如果ModelAndView不为空，且ModelAndView.view为null，设置默认的view
+						|
+						V
+	执行HandlerExecutionChain.interceptorList[HandlerInterceptor].postHandle(request, response, handler, modelAndView)
+						|
+						V
+		执行DispatcherServlet.processDispatchResult(HttpServletRequest, HttpServletResponse, 
+			HttpExecutionChain, ModelAndView, Exception)，处理Exception
+						|
+						V
+	如果Exception不为空，执行DispatcherServlet.processHandlerException(request, response, HandlerMethod, Exception)
+						|
+						V
+	执行DispatcherServlet.handlerExceptionResolvers [HandlerExceptionResolver].resolveException(request, response, handler, ex)
+						|
+						V
+		执行HandlerExecutionChain.triggerAfterCompletion(request, response, null)
+						|
+						V
+	执行HandlerExecutionChain.interceptorList [HandlerInterceptor].afterCompletion(request, response, handler, ex)
+						|
+						V
+				清理当前HttpServletRequest的multipart
+						|
+						V
+			DispatcherServlet.doDispatch(request, response)执行完毕
+						|
+						V
+			DispatcherServlet.doService(request, response)执行完毕
+						|
+						V
+				发布ServletRequestHandledEvent事件
+						|
+						V
+			DispatcherServlet.processRequest(request, response)执行完毕
+						|
+						V
+			ServletHandler.handleRequest(HttpServerExchange)执行完毕
+						|
+						V
+		ServletSecurityRoleHandler.next(FilterHandler).handleRequest(exchange)执行完毕
+						|
+						V
+			执行HttpServletResponse.responseDone()关闭OutputStream
+						|
+						V
+	ServletInitialHandler.handleFirstRequest(HttpServerExchange, ServletRequestContext)执行完毕
+						|
+						V
+		ServletInitialHandler.dispatchHandler.handleRequest(exchange)执行完毕
+						
+<h2 id="6">6.SpringBoot异常处理</h2>
+&emsp;&emsp; 当DispatcherServlet.doDispatch(HttpServletRequest, HttpServletResponse)执行异常时，
+会根据DispatcherServlet.handlerExceptionResolvers，依次处理异常。
+
+    DispatcherServlet.handlerExceptionResolvers包含:
+    	1，DefaultErrorAttributes: 
+	    出现错误数据时，提供默认的参数值，包括：timestamp、status、error、exception、message、
+	    errors、trace、path、requestId。
+	2，HandlerExceptionResolverComposite: 
+	    本身不处理Exception，但包含一个HandlerExceptionResolver集合属性，
+	    利用其中的HandlerExceptionResolver来处理Exception。
+	
+    在WebMvcConfigurationSupport中通过@Bean创建HandlerExceptionResolver Bean时：
+    	1，先创建List<HandlerExceptionResolver> exceptionResolvers，获取所有的WebMvcConfigurer Bean集合，
+	    执行[WebMvcConfigurer].configureHandlerExceptionResolvers(exceptionResolvers)，
+	    通过这种方式添加HandlerExceptionResolver。
+	2，如果exceptionResolvers为空，向其中添加默认的HandlerExceptionResolver。
+	    并且执行ExceptionHandlerExceptionResolver.afterPropertiesSet()。
+	    会添加三种HandlerExceptionResolver，包括：
+	    	ExceptionHandlerExceptionResolver：根据@ExceptionHandler来处理异常、
+	    	ResponseStatusExceptionResolver：根据@ResponseStatus处理异常、
+		DefaultHandlerExceptionResolver。
+	3，创建HandlerExceptionResolverComposite，并设置exceptionResolvers。
+    
+    		ExceptionHandlerExceptionResolver.afterPropertiesSet()
+					|
+					V
+		获取所有被@ControllerAdvice注解的Bean，创建ControllerAdviceBean集合，
+		ControllerAdviceBean(beanName, beanFactory, ControllerAdvice)
+	     ------------------------->	|
+	    |				V
+	    |	创建ExceptionHandlerMethodResolver(Class beanType)
+	    |				|
+	    |				V
+	    |	根据beanType找到Bean上被@ExceptionHandler注解的Method集合
+	    |				|
+	    |				V
+	    |	根据Method上的@ExceptionHandler，找到支持的Throwable类型，
+	    |	设置ExceptionHandlerMethodResolver.mappedMethods，
+	    |	一种Throwable只能被一个@ExceptionHandler方式处理
+	    |				|
+	    |				V
+	    |	向ExceptionHandlerExceptionResolver.exceptionHandlerAdviceCache中，
+	    |	添加ControllerAdviceBean和ExceptionHandlerMethodResolver
+	     -------------------------- |
+	    loop ControllerAdviceBeans  V
+	设置ExceptionHandlerExceptionResolver的：argumentResolvers、returnValueHandlers
+					
+### DispatcherServlet异常处理
+&emsp;&emsp; DispatcherServlet使用ExceptionHandlerExceptionResolver.resolveException()
+来处理异常。先获取Controller Bean对应的ExceptionHandlerMethodResolver，使用Bean中被@ExceptionHandler
+注解的方法来处理异常，如果没找到@ExceptionHandler方法，则根据@ControllerAdvice Bean，
+来获取@ExceptionHandler方法，来处理异常。
+
+    	ExceptionHandlerExceptionResolver.resolveException(request, response, handler, ex)
+					|
+					V
+	先根据HandlerMethod的beanType，从ExceptionHandlerExceptionResolver.exceptionHandlerCache，
+	获取ExceptionHandlerMethodResolver，没有的话则创建，并设置到exceptionHandlerCache
+					|
+					V
+	执行ExceptionHandlerMethodResolver.resolveMethod(exception)获取处理异常的Method------
+					| 没找到Method				  找到   |
+					V						  |
+	根据exceptionHandlerAdviceCache，获取ExceptionHandlerMethodResolver		       |
+					|						  |
+					V						  |
+	执行ExceptionHandlerMethodResolver.resolveMethod(exception)获取处理异常的Method	    |
+					|						  |
+					V						  |
+	根据ExceptionHandlerMethodResolver.mappedMethods和异常类型，获取Method		   |
+					|		 ----------------------------------					
+					|		|
+					V		V
+		如果Method不为空，根据@ExceptionHandler方法所在Bean及Method
+		创建ServletInvocableHandlerMethod，否则返回null
+					|
+					V
+			    根据Method获取对应的桥接方法
+					|
+					V
+	首先根据桥接方法的参数数量，创建HandlerMethodParameter列表赋值给 parameters
+					|
+					V
+	解析Method上的@ResponseStatus，赋值给 responseStatus、responseStatusReason
+					|
+					V
+			根据Bean和Method获取description
+					|
+					V
+			ServletInvocableHandlerMethod创建完毕
+					|
+					V
+		如果ServletInvocableHandlerMethod为null，则直接return
+					|
+					V
+		设置ServletInvocableHandlerMethod的：resolvers、returnValueHandlers
+					|
+					V
+		执行ServletInvocableHandlerMethod.invokeAndHandle(
+		    ServletWebRequest, ModelAndViewContainer, arguments)
+		    			|
+					V
+	执行ServletInvocableHandlerMethod.invokeForRequest(webRequest, mavContainer, args)
+					|
+					V
+				设置Response status
+					|
+					V
+				处理returnValue
+					
+
+					
+					
+					
