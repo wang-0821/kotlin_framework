@@ -45,4 +45,15 @@ class DemoControllerTest : KtSpringTestBase() {
         )
         Assertions.assertEquals(result.body, "hello world")
     }
+
+    @Test
+    fun `test throw exception`() {
+        val result = RestTemplate().exchange(
+            "http://localhost:${envInfoProvider.port()}/api/v1/demo/throwException",
+            HttpMethod.GET,
+            HttpEntity.EMPTY,
+            Unit::class.java,
+            mapOf<String, String>()
+        ).body
+    }
 }
